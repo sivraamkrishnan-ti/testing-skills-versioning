@@ -1,0 +1,150 @@
+# .github/workflows/sync-expert.yml
+#
+# Copy this file into YOUR GitHub repo under .github/workflows/
+#
+# This workflow syncs your repository's system_prompt.md and skills/ directory
+# to your Braintrust Expert whenever you push to main.
+#
+# ── Required secrets ──────────────────────────────────────────────────────────
+# Go to: GitHub repo → Settings → Secrets and variables → Actions → New repository secret
+#
+#   BRAINTRUST_API_KEY  — your Braintrust API key
+#                         (Braintrust UI → Settings → API Keys → Create)
+#
+#   BRAINTRUST_AGENT_ID — your Expert's agent ID
+#                         (copy from the Expert's URL in Braintrust:
+#                          .../experts/<AGENT_ID>)
+#
+# ── Repo structure ────────────────────────────────────────────────────────────
+#
+#   system_prompt.md          ← system prompt text (optional — omit to leave unchanged)
+#   skills/
+#     my-skill/               ← one directory per skill
+#       script.py
+#       README.md
+#     another-skill/
+#       handler.py
+#
+# ── Behaviour ─────────────────────────────────────────────────────────────────
+#   • Triggers on push to main when system_prompt.md or skills/** change
+#   • Can also be triggered manually from the Actions tab (workflow_dispatch)
+#   • If system_prompt.md exists → updates the Expert's system prompt
+#   • If skills/ contains directories → replaces ALL Expert skills with them
+#   • Fields that are absent from the repo are left unchanged in Braintrust
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Sync to Braintrust Expert
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'system_prompt.md'
+      - 'skills/**'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build payload and sync to Braintrust
+        env:
+          BRAINTRUST_API_KEY: ${{ secrets.BRAINTRUST_API_KEY }}
+          BRAINTRUST_AGENT_ID: ${{ secrets.BRAINTRUST_AGENT_ID }}
+        run: |
+          # Node.js is always available on ubuntu-latest.
+          # This script reads system_prompt.md and skills/ then sends one PUT request.
+          PAYLOAD=$(node -e "
+            const fs   = require('fs');
+            const path = require('path');
+
+            const payload = {};
+
+            // ── System prompt ───────────────────────────────────────────────
+            if (fs.existsSync('system_prompt.md')) {
+              payload.prompt = fs.readFileSync('system_prompt.md', 'utf8');
+            }
+
+            // ── Skills ──────────────────────────────────────────────────────
+            const skillsDir = 'skills';
+            if (fs.existsSync(skillsDir)) {
+              const skills = [];
+
+              for (const skillName of fs.readdirSync(skillsDir).sort()) {
+                const skillPath = path.join(skillsDir, skillName);
+                if (!fs.statSync(skillPath).isDirectory()) continue;
+
+                const files = [];
+                for (const filename of fs.readdirSync(skillPath).sort()) {
+                  const filepath = path.join(skillPath, filename);
+                  if (!fs.statSync(filepath).isFile()) continue;
+
+                  const content     = fs.readFileSync(filepath).toString('base64');
+                  const ext         = path.extname(filename).toLowerCase();
+
+                  const CONTENT_TYPES = {
+                    '.py':   'text/x-python',
+                    '.md':   'text/markdown',
+                    '.json': 'application/json',
+                    '.yaml': 'application/x-yaml',
+                    '.yml':  'application/x-yaml',
+                    '.txt':  'text/plain',
+                    '.js':   'text/javascript',
+                    '.ts':   'application/typescript',
+                    '.sh':   'text/x-sh',
+                    '.toml': 'application/toml',
+                    '.csv':  'text/csv',
+                    '.html': 'text/html',
+                    '.xml':  'application/xml',
+                  };
+
+                  files.push({
+                    filename,
+                    content,
+                    contentType: CONTENT_TYPES[ext] || 'application/octet-stream',
+                    encoding: 'base64',
+                  });
+                }
+
+                if (files.length > 0) {
+                  skills.push({ name: skillName, files });
+                }
+              }
+
+              if (skills.length > 0) {
+                payload.skills = skills;
+              }
+            }
+
+            if (!payload.prompt && !payload.skills) {
+              console.error(
+                'ERROR: Nothing to sync — add system_prompt.md and/or a skills/ directory.'
+              );
+              process.exit(1);
+            }
+
+            process.stdout.write(JSON.stringify(payload));
+          ")
+
+          echo "Syncing to Expert: $BRAINTRUST_AGENT_ID"
+
+          HTTP_STATUS=$(curl -s -o /tmp/braintrust_sync_response.json -w "%{http_code}" \
+            -X PUT "http://localhost:3000/api/agents/$BRAINTRUST_AGENT_ID/sync" \
+            -H "x-api-key: $BRAINTRUST_API_KEY" \
+            -H "Content-Type: application/json" \
+            --max-time 120 \
+            -d "$PAYLOAD")
+
+          RESPONSE=$(cat /tmp/braintrust_sync_response.json)
+          echo "HTTP status : $HTTP_STATUS"
+          echo "Response    : $(echo "$RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$RESPONSE")"
+
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "Sync FAILED — see response above for details."
+            exit 1
+          fi
+
+          echo "Sync complete."
