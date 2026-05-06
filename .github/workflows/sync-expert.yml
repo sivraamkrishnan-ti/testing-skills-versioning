@@ -132,7 +132,7 @@ jobs:
           echo "Syncing to Expert: $BRAINTRUST_AGENT_ID"
 
           HTTP_STATUS=$(curl -s -o /tmp/braintrust_sync_response.json -w "%{http_code}" \
-            -X PUT "http://localhost:3000/api/agents/$BRAINTRUST_AGENT_ID/sync" \
+            -X PUT "https://melany-sleuthlike-deeply.ngrok-free.dev/api/agents/$BRAINTRUST_AGENT_ID/sync" \
             -H "x-api-key: $BRAINTRUST_API_KEY" \
             -H "Content-Type: application/json" \
             --max-time 120 \
