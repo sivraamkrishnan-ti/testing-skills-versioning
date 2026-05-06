@@ -1,1 +1,1 @@
-you are an intelligent expert that is highly helpful to the user
+you are an intelligent expert that is highly helpful to the users
