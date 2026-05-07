@@ -28,9 +28,9 @@
 # ── Behaviour ─────────────────────────────────────────────────────────────────
 #   • Triggers on push to main when system_prompt.md or skills/** change
 #   • Can also be triggered manually from the Actions tab (workflow_dispatch)
-#   • If system_prompt.md exists → updates the Expert's system prompt
-#   • If skills/ contains directories → replaces ALL Expert skills with them
-#   • Fields that are absent from the repo are left unchanged in Braintrust
+#   • If system_prompt.md exists → updates the Expert's system prompt (2 calls)
+#   • If skills/ contains directories → replaces ALL Expert skills (1 call)
+#   • Fields absent from the repo are left unchanged in Braintrust
 # ─────────────────────────────────────────────────────────────────────────────
 
 name: Sync to Braintrust Expert
@@ -50,101 +50,126 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build payload and sync to Braintrust
+      - name: Build payloads and sync to Braintrust
         env:
           BRAINTRUST_API_KEY: ${{ secrets.BRAINTRUST_API_KEY }}
           BRAINTRUST_AGENT_ID: ${{ secrets.BRAINTRUST_AGENT_ID }}
         run: |
-          # Node.js is always available on ubuntu-latest.
-          # This script reads system_prompt.md and skills/ then sends one PUT request.
-          PAYLOAD=$(node -e "
+          # ── Build combined result JSON ──────────────────────────────────────
+          node -e "
             const fs   = require('fs');
             const path = require('path');
+            const out  = { prompt: null, skills: null };
 
-            const payload = {};
-
-            // ── System prompt ───────────────────────────────────────────────
             if (fs.existsSync('system_prompt.md')) {
-              payload.prompt = fs.readFileSync('system_prompt.md', 'utf8');
+              out.prompt = fs.readFileSync('system_prompt.md', 'utf8');
             }
 
-            // ── Skills ──────────────────────────────────────────────────────
             const skillsDir = 'skills';
             if (fs.existsSync(skillsDir)) {
               const skills = [];
 
+              const listFilesRecursively = (rootDir) => {
+                const files = [];
+                const walk = (currentDir, relativePrefix) => {
+                  relativePrefix = relativePrefix || '';
+                  const entries = fs.readdirSync(currentDir, { withFileTypes: true })
+                    .sort((a, b) => a.name.localeCompare(b.name));
+                  for (const entry of entries) {
+                    const entryPath    = path.join(currentDir, entry.name);
+                    const relativePath = relativePrefix
+                      ? path.posix.join(relativePrefix, entry.name)
+                      : entry.name;
+                    if (entry.isDirectory()) { walk(entryPath, relativePath); continue; }
+                    if (!entry.isFile()) continue;
+                    files.push({ filepath: entryPath, filename: relativePath });
+                  }
+                };
+                walk(rootDir);
+                return files;
+              };
+
               for (const skillName of fs.readdirSync(skillsDir).sort()) {
                 const skillPath = path.join(skillsDir, skillName);
                 if (!fs.statSync(skillPath).isDirectory()) continue;
-
                 const files = [];
-                for (const filename of fs.readdirSync(skillPath).sort()) {
-                  const filepath = path.join(skillPath, filename);
-                  if (!fs.statSync(filepath).isFile()) continue;
-
-                  const content     = fs.readFileSync(filepath).toString('base64');
-                  const ext         = path.extname(filename).toLowerCase();
-
+                for (const fileEntry of listFilesRecursively(skillPath)) {
+                  const content = fs.readFileSync(fileEntry.filepath).toString('base64');
+                  const ext     = path.extname(fileEntry.filename).toLowerCase();
                   const CONTENT_TYPES = {
-                    '.py':   'text/x-python',
-                    '.md':   'text/markdown',
-                    '.json': 'application/json',
-                    '.yaml': 'application/x-yaml',
-                    '.yml':  'application/x-yaml',
-                    '.txt':  'text/plain',
-                    '.js':   'text/javascript',
-                    '.ts':   'application/typescript',
-                    '.sh':   'text/x-sh',
-                    '.toml': 'application/toml',
-                    '.csv':  'text/csv',
-                    '.html': 'text/html',
-                    '.xml':  'application/xml',
+                    '.py': 'text/x-python', '.md': 'text/markdown',
+                    '.json': 'application/json', '.yaml': 'application/x-yaml',
+                    '.yml': 'application/x-yaml', '.txt': 'text/plain',
+                    '.js': 'text/javascript', '.ts': 'application/typescript',
+                    '.sh': 'text/x-sh', '.toml': 'application/toml',
+                    '.csv': 'text/csv', '.html': 'text/html', '.xml': 'application/xml',
                   };
-
                   files.push({
-                    filename,
+                    name: fileEntry.filename,
                     content,
                     contentType: CONTENT_TYPES[ext] || 'application/octet-stream',
                     encoding: 'base64',
                   });
                 }
-
-                if (files.length > 0) {
-                  skills.push({ name: skillName, files });
-                }
+                if (files.length > 0) skills.push({ name: skillName, files });
               }
-
-              if (skills.length > 0) {
-                payload.skills = skills;
-              }
+              if (skills.length > 0) out.skills = skills;
             }
 
-            if (!payload.prompt && !payload.skills) {
-              console.error(
-                'ERROR: Nothing to sync — add system_prompt.md and/or a skills/ directory.'
-              );
+            if (!out.prompt && !out.skills) {
+              console.error('ERROR: Nothing to sync — add system_prompt.md and/or a skills/ directory.');
               process.exit(1);
             }
+            process.stdout.write(JSON.stringify(out));
+          " > /tmp/braintrust_sync_result.json
 
-            process.stdout.write(JSON.stringify(payload));
-          ")
+          HAS_PROMPT=$(node -e "const d=JSON.parse(require('fs').readFileSync('/tmp/braintrust_sync_result.json','utf8')); process.stdout.write(d.prompt !== null ? 'true' : 'false')")
+          HAS_SKILLS=$(node -e "const d=JSON.parse(require('fs').readFileSync('/tmp/braintrust_sync_result.json','utf8')); process.stdout.write(d.skills !== null ? 'true' : 'false')")
 
-          echo "Syncing to Expert: $BRAINTRUST_AGENT_ID"
+          # ── Call 1 + 2: GET current agent → PUT prompt ──────────────────────
+          if [ "$HAS_PROMPT" = "true" ]; then
+            echo "Fetching current agent state..."
+            curl -s \
+              "https://braintrust.ti.trilogy.com/api/agents/$BRAINTRUST_AGENT_ID" \
+              -H "x-api-key: $BRAINTRUST_API_KEY" > /tmp/braintrust_agent.json
 
-          HTTP_STATUS=$(curl -s -o /tmp/braintrust_sync_response.json -w "%{http_code}" \
-            -X PUT "https://melany-sleuthlike-deeply.ngrok-free.dev/api/agents/$BRAINTRUST_AGENT_ID/sync" \
-            -H "x-api-key: $BRAINTRUST_API_KEY" \
-            -H "Content-Type: application/json" \
-            --max-time 120 \
-            -d "$PAYLOAD")
+            node -e "
+              const fs     = require('fs');
+              const result = JSON.parse(fs.readFileSync('/tmp/braintrust_sync_result.json','utf8'));
+              const agent  = JSON.parse(fs.readFileSync('/tmp/braintrust_agent.json','utf8'));
+              const body   = { prompt: result.prompt };
+              if (agent.syncedDriveFolderId) body.syncedDriveFolderId = agent.syncedDriveFolderId;
+              process.stdout.write(JSON.stringify(body));
+            " > /tmp/braintrust_prompt_payload.json
 
-          RESPONSE=$(cat /tmp/braintrust_sync_response.json)
-          echo "HTTP status : $HTTP_STATUS"
-          echo "Response    : $(echo "$RESPONSE" | python3 -m json.tool 2>/dev/null || echo "$RESPONSE")"
+            echo "Updating system prompt..."
+            HTTP_STATUS=$(curl -s -o /tmp/braintrust_prompt_response.json -w "%{http_code}" \
+              -X PUT "https://melany-sleuthlike-deeply.ngrok-free.dev/api/agents/$BRAINTRUST_AGENT_ID" \
+              -H "x-api-key: $BRAINTRUST_API_KEY" \
+              -H "Content-Type: application/json" \
+              --max-time 120 \
+              -d @/tmp/braintrust_prompt_payload.json)
+            echo "Prompt — HTTP $HTTP_STATUS: $(cat /tmp/braintrust_prompt_response.json | python3 -m json.tool 2>/dev/null || cat /tmp/braintrust_prompt_response.json)"
+            if [ "$HTTP_STATUS" != "200" ]; then echo "Prompt update FAILED."; exit 1; fi
+          fi
 
-          if [ "$HTTP_STATUS" != "200" ]; then
-            echo "Sync FAILED — see response above for details."
-            exit 1
+          # ── Call 3: POST upsert skills ────────────────────────────────────────
+          if [ "$HAS_SKILLS" = "true" ]; then
+            node -e "
+              const fs     = require('fs');
+              const result = JSON.parse(fs.readFileSync('/tmp/braintrust_sync_result.json','utf8'));
+              process.stdout.write(JSON.stringify({ mode: 'replace', skills: result.skills }));
+            " > /tmp/braintrust_skills_payload.json
+
+            echo "Upserting skills..."
+            HTTP_STATUS=$(curl -s -o /tmp/braintrust_skills_response.json -w "%{http_code}" \
+              -X POST "https://braintrust.ti.trilogy.com/api/agents/$BRAINTRUST_AGENT_ID/expert-skills/upsert" \
+              -H "x-api-key: $BRAINTRUST_API_KEY" \
+              -H "Content-Type: application/json" \
+              --max-time 120 \
+              -d @/tmp/braintrust_skills_payload.json)
+            echo "Skills — HTTP $HTTP_STATUS: $(cat /tmp/braintrust_skills_response.json | python3 -m json.tool 2>/dev/null || cat /tmp/braintrust_skills_response.json)"
+            if [ "$HTTP_STATUS" != "200" ]; then echo "Skills upsert FAILED."; exit 1; fi
           fi
 
           echo "Sync complete."
